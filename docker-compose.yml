@@ -1,0 +1,32 @@
+services:
+  gateway:
+    build:
+      context: ./gateway
+    container_name: llm-router-gateway
+    env_file:
+      - ./.env
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_SMALL_MODEL=${OPENAI_SMALL_MODEL:-gpt-4o-mini}
+      - OPENAI_MID_MODEL=${OPENAI_MID_MODEL:-gpt-4.1-mini}
+      - OPENAI_BIG_MODEL=${OPENAI_BIG_MODEL:-gpt-4.1}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-}
+
+  web:
+    build:
+      context: ./web
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://gateway:8080}
+        - VITE_GATEWAY_API_KEY=${VITE_GATEWAY_API_KEY:-}
+    container_name: llm-router-web
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+    environment:
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://gateway:8080}
+      - VITE_GATEWAY_API_KEY=${VITE_GATEWAY_API_KEY:-}

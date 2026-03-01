@@ -1,0 +1,22 @@
+# Env / secrets
+.env
+.env.*
+*.env
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Build artifacts
+*.tsbuildinfo
