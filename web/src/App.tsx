@@ -199,6 +199,30 @@ export function App(): JSX.Element {
               tool_used: entry.tool_used,
               latency_ms: entry.latency_ms,
               usage: entry.usage,
+              input_tokens_est: entry.input_tokens_est,
+              output_tokens_est: entry.output_tokens_est,
+              expected_cost_est: entry.expected_cost_est,
+              candidate_costs: entry.candidate_costs,
+              chosen_reason: entry.chosen_reason,
+              max_cost_usd: entry.max_cost_usd,
+              budget_actions: entry.budget_actions,
+              expected_cost_vs_budget: entry.expected_cost_vs_budget,
+              actual_usage: entry.actual_usage,
+              actual_cost: entry.actual_cost,
+              compacted: entry.compacted,
+              tokens_before_est: entry.tokens_before_est,
+              tokens_after_est: entry.tokens_after_est,
+              savings_tokens_est: entry.savings_tokens_est,
+              expected_cost_savings_est: entry.expected_cost_savings_est,
+              compactor_expected_cost_est: entry.compactor_expected_cost_est,
+              compactor_cost_est: entry.compactor_cost_est,
+              compactor_timeout_ms: entry.compactor_timeout_ms,
+              compactor_latency_ms: entry.compactor_latency_ms,
+              compaction_reason: entry.compaction_reason,
+              compaction_attempted: entry.compaction_attempted,
+              compaction_applied: entry.compaction_applied,
+              compaction_skipped_reason: entry.compaction_skipped_reason,
+              compaction_error: entry.compaction_error,
               ts: entry.ts,
               error: entry.error
             });
@@ -258,8 +282,32 @@ export function App(): JSX.Element {
             confidence: number;
             reason: string;
             fallback_route?: string;
+            input_tokens_est?: number;
+            output_tokens_est?: number;
+            expected_cost_est?: number;
+            candidate_costs?: DecisionCard['candidate_costs'];
+            chosen_reason?: DecisionCard['chosen_reason'];
+            max_cost_usd?: number;
+            budget_actions?: DecisionCard['budget_actions'];
+            expected_cost_vs_budget?: string;
+            actual_usage?: DecisionCard['actual_usage'];
+            actual_cost?: number;
+            compacted?: boolean;
+            tokens_before_est?: number;
+            tokens_after_est?: number;
+            savings_tokens_est?: number;
+            expected_cost_savings_est?: number;
+            compactor_expected_cost_est?: number;
+            compactor_cost_est?: number;
+            compactor_timeout_ms?: number;
+            compactor_latency_ms?: number;
+            compaction_reason?: DecisionCard['compaction_reason'];
+            compaction_attempted?: boolean;
+            compaction_applied?: boolean;
+            compaction_skipped_reason?: DecisionCard['compaction_skipped_reason'];
+            compaction_error?: string;
           };
-          usage: { input_chars: number; output_chars: number };
+          usage: { input_chars_user: number; input_chars_total: number; input_chars: number; output_chars: number };
           latency_ms: number;
           model_used: string;
         };
@@ -279,7 +327,31 @@ export function App(): JSX.Element {
           fallback_used: false,
           tool_used: data.decision?.route === 'tool.calculator',
           latency_ms: data.latency_ms ?? 0,
-          usage: data.usage ?? { input_chars: 0, output_chars: 0 }
+          usage: data.usage ?? { input_chars_user: 0, input_chars_total: 0, input_chars: 0, output_chars: 0 },
+          input_tokens_est: data.decision?.input_tokens_est,
+          output_tokens_est: data.decision?.output_tokens_est,
+          expected_cost_est: data.decision?.expected_cost_est,
+          candidate_costs: data.decision?.candidate_costs,
+          chosen_reason: data.decision?.chosen_reason,
+          max_cost_usd: data.decision?.max_cost_usd,
+          budget_actions: data.decision?.budget_actions,
+          expected_cost_vs_budget: data.decision?.expected_cost_vs_budget,
+          actual_usage: data.decision?.actual_usage,
+          actual_cost: data.decision?.actual_cost,
+          compacted: data.decision?.compacted,
+          tokens_before_est: data.decision?.tokens_before_est,
+          tokens_after_est: data.decision?.tokens_after_est,
+          savings_tokens_est: data.decision?.savings_tokens_est,
+          expected_cost_savings_est: data.decision?.expected_cost_savings_est,
+          compactor_expected_cost_est: data.decision?.compactor_expected_cost_est,
+          compactor_cost_est: data.decision?.compactor_cost_est,
+          compactor_timeout_ms: data.decision?.compactor_timeout_ms,
+          compactor_latency_ms: data.decision?.compactor_latency_ms,
+          compaction_reason: data.decision?.compaction_reason,
+          compaction_attempted: data.decision?.compaction_attempted,
+          compaction_applied: data.decision?.compaction_applied,
+          compaction_skipped_reason: data.decision?.compaction_skipped_reason,
+          compaction_error: data.decision?.compaction_error
         };
         setCards((prev) => [card, ...prev]);
       } finally {
@@ -335,7 +407,29 @@ export function App(): JSX.Element {
               fallback_used: false,
               tool_used: Boolean(currentMeta.tool_used),
               latency_ms: 0,
-              usage: { input_chars: 0, output_chars: 0 }
+              usage: { input_chars_user: 0, input_chars_total: 0, input_chars: 0, output_chars: 0 },
+              input_tokens_est: Number(currentMeta.input_tokens_est ?? 0) || undefined,
+              output_tokens_est: Number(currentMeta.output_tokens_est ?? 0) || undefined,
+              expected_cost_est: Number(currentMeta.expected_cost_est ?? 0) || undefined,
+              candidate_costs: currentMeta.candidate_costs,
+              chosen_reason: currentMeta.chosen_reason,
+              max_cost_usd: Number(currentMeta.max_cost_usd ?? 0) || undefined,
+              budget_actions: currentMeta.budget_actions,
+              expected_cost_vs_budget: typeof currentMeta.expected_cost_vs_budget === 'string' ? currentMeta.expected_cost_vs_budget : undefined,
+              compacted: Boolean(currentMeta.compacted),
+              tokens_before_est: Number(currentMeta.tokens_before_est ?? 0) || undefined,
+              tokens_after_est: Number(currentMeta.tokens_after_est ?? 0) || undefined,
+              savings_tokens_est: Number(currentMeta.savings_tokens_est ?? 0) || undefined,
+              expected_cost_savings_est: Number(currentMeta.expected_cost_savings_est ?? 0) || undefined,
+              compactor_expected_cost_est: Number(currentMeta.compactor_expected_cost_est ?? 0) || undefined,
+              compactor_cost_est: Number(currentMeta.compactor_cost_est ?? 0) || undefined,
+              compactor_timeout_ms: Number(currentMeta.compactor_timeout_ms ?? 0) || undefined,
+              compactor_latency_ms: Number(currentMeta.compactor_latency_ms ?? 0) || undefined,
+              compaction_reason: currentMeta.compaction_reason,
+              compaction_attempted: Boolean(currentMeta.compaction_attempted),
+              compaction_applied: Boolean(currentMeta.compaction_applied),
+              compaction_skipped_reason: currentMeta.compaction_skipped_reason,
+              compaction_error: currentMeta.compaction_error
             };
             setCards((prev) => [card, ...prev.filter((c) => c.request_id !== card.request_id)]);
           }
@@ -351,9 +445,30 @@ export function App(): JSX.Element {
           }
 
           if (event.event === 'done') {
-            const usage = payload.usage as { input_chars: number; output_chars: number } | undefined;
+            const usage =
+              (payload.usage as { input_chars_user: number; input_chars_total: number; input_chars: number; output_chars: number } | undefined) ??
+              undefined;
             const latency = Number(payload.latency_ms ?? 0);
             const finalContent = String(payload.content ?? streamContent);
+            const actualUsage =
+              (payload.actual_usage as DecisionCard['actual_usage'] | undefined) ??
+              (payload.actualUsage as DecisionCard['actual_usage'] | undefined);
+            const actualCost = Number(payload.actual_cost ?? 0) || undefined;
+            const compacted = payload.compacted === true;
+            const tokensBefore = Number(payload.tokens_before_est ?? 0) || undefined;
+            const tokensAfter = Number(payload.tokens_after_est ?? 0) || undefined;
+            const savings = Number(payload.savings_tokens_est ?? 0) || undefined;
+            const expectedCostSavings = Number(payload.expected_cost_savings_est ?? 0) || undefined;
+            const compactorExpectedCost = Number(payload.compactor_expected_cost_est ?? 0) || undefined;
+            const compactorCost = Number(payload.compactor_cost_est ?? 0) || undefined;
+            const compactorTimeout = Number(payload.compactor_timeout_ms ?? 0) || undefined;
+            const compactorLatency = Number(payload.compactor_latency_ms ?? 0) || undefined;
+            const compactionReason = payload.compaction_reason as DecisionCard['compaction_reason'] | undefined;
+            const compactionAttempted = payload.compaction_attempted === true;
+            const compactionApplied = payload.compaction_applied === true;
+            const compactionSkippedReason =
+              payload.compaction_skipped_reason as DecisionCard['compaction_skipped_reason'] | undefined;
+            const compactionError = typeof payload.compaction_error === 'string' ? payload.compaction_error : undefined;
 
             setMessages((prev) => {
               const copy = [...prev];
@@ -369,6 +484,22 @@ export function App(): JSX.Element {
                         ...card,
                         latency_ms: latency,
                         usage: usage ?? card.usage,
+                        actual_usage: actualUsage ?? card.actual_usage,
+                        actual_cost: actualCost ?? card.actual_cost,
+                        compacted,
+                        tokens_before_est: tokensBefore ?? card.tokens_before_est,
+                        tokens_after_est: tokensAfter ?? card.tokens_after_est,
+                        savings_tokens_est: savings ?? card.savings_tokens_est,
+                        expected_cost_savings_est: expectedCostSavings ?? card.expected_cost_savings_est,
+                        compactor_expected_cost_est: compactorExpectedCost ?? card.compactor_expected_cost_est,
+                        compactor_cost_est: compactorCost ?? card.compactor_cost_est,
+                        compactor_timeout_ms: compactorTimeout ?? card.compactor_timeout_ms,
+                        compactor_latency_ms: compactorLatency ?? card.compactor_latency_ms,
+                        compaction_reason: compactionReason ?? card.compaction_reason,
+                        compaction_attempted: compactionAttempted || card.compaction_attempted,
+                        compaction_applied: compactionApplied || card.compaction_applied,
+                        compaction_skipped_reason: compactionSkippedReason ?? card.compaction_skipped_reason,
+                        compaction_error: compactionError ?? card.compaction_error,
                         fallback_used: Boolean(currentMeta?.fallback_route && currentMeta.route === 'llm.small' && !currentMeta.tool_used)
                       }
                     : card
@@ -633,8 +764,45 @@ export function App(): JSX.Element {
                   <div className="inline-flex items-center gap-1">
                     <Clock3 className="h-3 w-3" /> latency: {card.latency_ms}ms
                   </div>
-                  <div className="text-right">input_chars: {card.usage.input_chars}</div>
+                  <div className="text-right">input_chars_user: {card.usage.input_chars_user}</div>
+                  <div className="text-right">input_chars_total: {card.usage.input_chars_total}</div>
                   <div className="text-right col-span-2">output_chars: {card.usage.output_chars}</div>
+                  <div>input_tokens_est: {card.input_tokens_est ?? '-'}</div>
+                  <div className="text-right">output_tokens_est: {card.output_tokens_est ?? '-'}</div>
+                  <div>expected_cost_est: {card.expected_cost_est !== undefined ? `$${card.expected_cost_est.toFixed(6)}` : '-'}</div>
+                  <div className="text-right">max_cost_usd: {card.max_cost_usd !== undefined ? `$${card.max_cost_usd.toFixed(6)}` : '-'}</div>
+                  <div className="col-span-2">expected_vs_budget: {card.expected_cost_vs_budget ?? '-'}</div>
+                  <div className="col-span-2">
+                    budget_actions: {(card.budget_actions ?? []).join(', ') || '-'}
+                  </div>
+                  <div className="text-right">
+                    actual_tokens: {card.actual_usage?.input_tokens ?? '-'}/{card.actual_usage?.output_tokens ?? '-'}
+                  </div>
+                  <div className="col-span-2">actual_cost: {card.actual_cost !== undefined ? `$${card.actual_cost.toFixed(6)}` : '-'}</div>
+                  <div className="col-span-2">chosen_reason: {card.chosen_reason ?? '-'}</div>
+                  <div>compacted: {String(card.compacted ?? false)}</div>
+                  <div className="text-right">tokens: {card.tokens_before_est ?? '-'} {'->'} {card.tokens_after_est ?? '-'}</div>
+                  <div>savings_tokens_est: {card.savings_tokens_est ?? '-'}</div>
+                  <div className="text-right">
+                    expected_cost_savings_est: {card.expected_cost_savings_est !== undefined ? `$${card.expected_cost_savings_est.toFixed(6)}` : '-'}
+                  </div>
+                  <div>
+                    compactor_expected_cost_est: {card.compactor_expected_cost_est !== undefined ? `$${card.compactor_expected_cost_est.toFixed(6)}` : '-'}
+                  </div>
+                  <div className="text-right">compactor_cost_est: {card.compactor_cost_est !== undefined ? `$${card.compactor_cost_est.toFixed(6)}` : '-'}</div>
+                  <div>compactor_timeout_ms: {card.compactor_timeout_ms ?? '-'}</div>
+                  <div>compactor_latency_ms: {card.compactor_latency_ms ?? '-'}</div>
+                  <div className="text-right">compaction_reason: {card.compaction_reason ?? '-'}</div>
+                  <div>compaction_attempted: {String(card.compaction_attempted ?? false)}</div>
+                  <div className="text-right">compaction_applied: {String(card.compaction_applied ?? false)}</div>
+                  <div className="col-span-2">compaction_skipped_reason: {card.compaction_skipped_reason ?? '-'}</div>
+                  <div className="col-span-2">compaction_error: {card.compaction_error ?? '-'}</div>
+                  <div className="col-span-2 text-slate-500">
+                    candidates:{' '}
+                    {(card.candidate_costs ?? [])
+                      .map((c) => `${c.route}:${c.model} $${c.expected_cost_est.toFixed(6)}`)
+                      .join(' | ') || '-'}
+                  </div>
                 </div>
 
                 {card.error ? (

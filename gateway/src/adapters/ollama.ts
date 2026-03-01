@@ -1,4 +1,4 @@
-import type { ChatMessage, LLMAdapter, Usage } from '../types.js';
+import type { ChatMessage, LLMAdapter, TokenUsage, Usage } from '../types.js';
 
 export class OllamaAdapter implements LLMAdapter {
   constructor(private readonly baseUrl: string) {}
@@ -13,34 +13,65 @@ export class OllamaAdapter implements LLMAdapter {
     }
   }
 
-  async complete(messages: ChatMessage[], model: string): Promise<{ content: string; usage?: Usage }> {
+  async complete(
+    messages: ChatMessage[],
+    model: string,
+    options?: { max_output_tokens?: number }
+  ): Promise<{ content: string; usage?: Usage; token_usage?: TokenUsage }> {
     const response = await this.fetchWithTimeout(`${this.baseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, stream: false })
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: false,
+        options: options?.max_output_tokens ? { num_predict: options.max_output_tokens } : undefined
+      })
     });
 
     if (!response.ok) {
       throw new Error(`Ollama complete failed (${response.status})`);
     }
 
-    const data = (await response.json()) as { message?: { content?: string } };
+    const data = (await response.json()) as {
+      message?: { content?: string };
+      prompt_eval_count?: number;
+      eval_count?: number;
+    };
     const content = data.message?.content ?? '';
+    const inputCharsTotal = messages.reduce((sum, m) => sum + m.content.length, 0);
+    const inputCharsUser = [...messages].reverse().find((m) => m.role === 'user')?.content.length ?? 0;
 
     return {
       content,
       usage: {
-        input_chars: messages.reduce((sum, m) => sum + m.content.length, 0),
+        input_chars_user: inputCharsUser,
+        input_chars_total: inputCharsTotal,
+        input_chars: inputCharsTotal,
         output_chars: content.length
+      },
+      token_usage: {
+        input_tokens: data.prompt_eval_count,
+        output_tokens: data.eval_count
       }
     };
   }
 
-  async *stream(messages: ChatMessage[], model: string): AsyncGenerator<string, void, void> {
+  async *stream(
+    messages: ChatMessage[],
+    model: string,
+    onUsage?: (usage: TokenUsage) => void,
+    options?: { max_output_tokens?: number }
+  ): AsyncGenerator<string, void, void> {
     const response = await this.fetchWithTimeout(`${this.baseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages, stream: true })
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+        options: options?.max_output_tokens ? { num_predict: options.max_output_tokens } : undefined
+      })
     });
 
     if (!response.ok || !response.body) {
@@ -67,11 +98,17 @@ export class OllamaAdapter implements LLMAdapter {
           continue;
         }
 
-        let parsed: { message?: { content?: string }; done?: boolean };
+        let parsed: { message?: { content?: string }; done?: boolean; prompt_eval_count?: number; eval_count?: number };
         try {
-          parsed = JSON.parse(chunk) as { message?: { content?: string }; done?: boolean };
+          parsed = JSON.parse(chunk) as { message?: { content?: string }; done?: boolean; prompt_eval_count?: number; eval_count?: number };
         } catch {
           continue;
+        }
+        if (parsed.done && onUsage) {
+          onUsage({
+            input_tokens: parsed.prompt_eval_count,
+            output_tokens: parsed.eval_count
+          });
         }
         if (parsed.done) {
           return;

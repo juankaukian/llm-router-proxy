@@ -6,9 +6,15 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { OpenAIAdapter } from './adapters/openai.js';
 import { OllamaAdapter } from './adapters/ollama.js';
+import { maybeCompactContext } from './compaction/compactor.js';
+import { estimateOutputTokens } from './cost/outputPredictor.js';
+import { expectedCostUSD, findPricingByProviderModel, findPricingEntry, listRoutePricingCandidates, loadPricingConfig } from './cost/pricing.js';
+import { chooseCheapestReachableCandidate } from './cost/selector.js';
+import { estimateInputTokens } from './cost/tokenEstimator.js';
 import { RequestRouter } from './router.js';
 import { evaluateMath } from './tools/calculator.js';
-import type { ChatMessage, ChatRequestBody, ChatJsonResponse, RequestLogEntry, RouterDecision, SessionState, Usage } from './types.js';
+import { computeRequestCharMetrics, exceedsMaxRequestChars, validateMessageShape } from './validation.js';
+import type { ChatMessage, ChatRequestBody, ChatJsonResponse, CostCandidate, RequestLogEntry, RouterDecision, SessionState, TokenUsage, Usage } from './types.js';
 
 const PORT = Number(process.env.PORT ?? 8080);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? '';
@@ -21,11 +27,23 @@ const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:3000,http://127
 const MAX_BODY_BYTES = Number(process.env.MAX_BODY_BYTES ?? 65_536);
 const MAX_MESSAGES = Number(process.env.MAX_MESSAGES ?? 40);
 const MAX_CONTENT_CHARS = Number(process.env.MAX_CONTENT_CHARS ?? 8_000);
+const MAX_REQUEST_CHARS = Number(process.env.MAX_REQUEST_CHARS ?? 32_000);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS ?? 60_000);
 const RATE_LIMIT_CHAT_MAX = Number(process.env.RATE_LIMIT_CHAT_MAX ?? 60);
 const RATE_LIMIT_SSE_MAX = Number(process.env.RATE_LIMIT_SSE_MAX ?? 20);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? 8_000);
 const GATEWAY_API_KEY = process.env.GATEWAY_API_KEY ?? '';
+const PRICING_CONFIG_DIR = process.env.PRICING_CONFIG_DIR ?? process.cwd();
+const MAX_INPUT_TOKENS_TOOL = Number(process.env.MAX_INPUT_TOKENS_TOOL ?? 8_000);
+const MAX_INPUT_TOKENS_MATH = Number(process.env.MAX_INPUT_TOKENS_MATH ?? 12_000);
+const MAX_INPUT_TOKENS_MID = Number(process.env.MAX_INPUT_TOKENS_MID ?? 24_000);
+const MAX_INPUT_TOKENS_BIG = Number(process.env.MAX_INPUT_TOKENS_BIG ?? 64_000);
+const COMPACT_KEEP_LAST_TURNS = Number(process.env.COMPACT_KEEP_LAST_TURNS ?? 6);
+const COMPACT_KEEP_LAST_LOG_LINES = 120;
+const COMPACT_MIN_SAVINGS_TOKENS = Number(process.env.COMPACT_MIN_SAVINGS_TOKENS ?? 1000);
+const COMPACTOR_OUTPUT_TOKENS_EST = Number(process.env.COMPACTOR_OUTPUT_TOKENS_EST ?? 600);
+const COMPACTOR_TIMEOUT_MS = Number(process.env.COMPACTOR_TIMEOUT_MS ?? 20000);
+const LOG_TRACE_USAGE = process.env.LOG_TRACE_USAGE === 'true';
 
 type DiagLevel = 'info' | 'warn' | 'error';
 interface DiagLine {
@@ -48,11 +66,29 @@ interface DiagStatus {
     openai: BackendStatus & { models: { small: string; mid: string; big: string } };
     ollama: BackendStatus & { model: string | null };
   };
+  pricing: {
+    loaded: boolean;
+    path: string;
+    currency: string;
+    warnings: string[];
+    missing_entries: Array<{ route: 'llm.small' | 'llm.mid' | 'llm.big'; provider: 'openai' | 'ollama'; model: string }>;
+    example_cost_1k_in_1k_out: Array<{
+      route: 'llm.small' | 'llm.mid' | 'llm.big';
+      provider: 'openai' | 'ollama';
+      model: string;
+      in_per_1m: number;
+      out_per_1m: number;
+      expected_cost_usd: number;
+    }>;
+  };
   last_startup_report: DiagLine[];
   suggestions: string[];
 }
 
 const useOllamaSmall = Boolean(OLLAMA_BASE_URL && OLLAMA_MODEL);
+const COMPACTOR_PROVIDER = (process.env.COMPACTOR_PROVIDER ?? (useOllamaSmall ? 'ollama' : 'openai')) as 'openai' | 'ollama';
+const COMPACTOR_MODEL = process.env.COMPACTOR_MODEL ?? (useOllamaSmall ? (OLLAMA_MODEL ?? OPENAI_SMALL_MODEL) : OPENAI_SMALL_MODEL);
+const COMPACTOR_BASE_URL = process.env.COMPACTOR_BASE_URL ?? OLLAMA_BASE_URL ?? '';
 const openai = OPENAI_API_KEY ? new OpenAIAdapter(OPENAI_API_KEY) : null;
 const ollama = useOllamaSmall ? new OllamaAdapter((OLLAMA_BASE_URL as string).replace(/\/$/, '')) : null;
 
@@ -61,6 +97,8 @@ const router = new RequestRouter({
   mid: OPENAI_MID_MODEL,
   big: OPENAI_BIG_MODEL
 });
+const pricingLoad = loadPricingConfig(PRICING_CONFIG_DIR);
+const pricingConfig = pricingLoad.config;
 
 const sessions = new Map<string, SessionState>();
 const logsBySession = new Map<string, RequestLogEntry[]>();
@@ -101,9 +139,18 @@ const diagStatus: DiagStatus = {
       missing_env: []
     }
   },
+  pricing: {
+    loaded: pricingLoad.loaded,
+    path: pricingLoad.path,
+    currency: pricingConfig.currency,
+    warnings: pricingLoad.warnings,
+    missing_entries: [],
+    example_cost_1k_in_1k_out: []
+  },
   last_startup_report: [],
   suggestions: []
 };
+const reachableModels = new Set<string>();
 
 const app = Fastify({ logger: false, bodyLimit: MAX_BODY_BYTES });
 const allowedOrigins = CORS_ORIGIN.split(',')
@@ -333,6 +380,15 @@ function buildMessages(messages: ChatMessage[], session?: SessionState): ChatMes
   ];
 }
 
+function makeUsage(inputCharsUser: number, inputCharsTotal: number, outputChars: number): Usage {
+  return {
+    input_chars_user: inputCharsUser,
+    input_chars_total: inputCharsTotal,
+    input_chars: inputCharsTotal,
+    output_chars: outputChars
+  };
+}
+
 function getLastUser(messages: ChatMessage[]): string {
   return [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
 }
@@ -346,6 +402,21 @@ function pushLog(entry: RequestLogEntry): void {
   logsBySession.set(entry.session_id, list);
   enforceMapLimit(logsBySession, MAX_SESSION_KEYS);
   process.stdout.write(`${JSON.stringify(entry)}\n`);
+  if (LOG_TRACE_USAGE) {
+    process.stdout.write(
+      `${JSON.stringify({
+        ts: new Date().toISOString(),
+        level: 'trace',
+        kind: 'usage_lengths',
+        request_id: entry.request_id,
+        session_id: entry.session_id,
+        input_chars_user: entry.usage.input_chars_user,
+        input_chars_total: entry.usage.input_chars_total,
+        max_content_chars: MAX_CONTENT_CHARS,
+        max_request_chars: MAX_REQUEST_CHARS
+      })}\n`
+    );
+  }
 }
 
 function makeLogEntry(args: {
@@ -360,6 +431,30 @@ function makeLogEntry(args: {
   toolUsed: boolean;
   latencyMs: number;
   usage: Usage;
+  inputTokensEst?: number;
+  outputTokensEst?: number;
+  expectedCostEst?: number;
+  candidateCosts?: CostCandidate[];
+  chosenReason?: 'cheapest_by_expected_cost' | 'policy_default';
+  maxCostUsd?: number;
+  budgetActions?: Array<'compacted' | 'reduced_output_tokens' | 'model_switched'>;
+  expectedCostVsBudget?: string;
+  actualUsage?: TokenUsage;
+  actualCost?: number;
+  compacted?: boolean;
+  tokensBeforeEst?: number;
+  tokensAfterEst?: number;
+  savingsTokensEst?: number;
+  expectedCostSavingsEst?: number;
+  compactorExpectedCostEst?: number;
+  compactorCostEst?: number;
+  compactorTimeoutMs?: number;
+  compactorLatencyMs?: number;
+  compactionReason?: 'over_budget' | 'worth_it';
+  compactionAttempted?: boolean;
+  compactionApplied?: boolean;
+  compactionSkippedReason?: 'skipped_threshold' | 'tool_route' | 'code_edit_preserve';
+  compactionError?: string;
   error: string | null;
 }): RequestLogEntry {
   return {
@@ -375,35 +470,186 @@ function makeLogEntry(args: {
     tool_used: args.toolUsed,
     latency_ms: args.latencyMs,
     usage: args.usage,
+    input_tokens_est: args.inputTokensEst,
+    output_tokens_est: args.outputTokensEst,
+    expected_cost_est: args.expectedCostEst,
+    candidate_costs: args.candidateCosts,
+    chosen_reason: args.chosenReason,
+    max_cost_usd: args.maxCostUsd,
+    budget_actions: args.budgetActions,
+    expected_cost_vs_budget: args.expectedCostVsBudget,
+    actual_usage: args.actualUsage,
+    actual_cost: args.actualCost,
+    compacted: args.compacted,
+    tokens_before_est: args.tokensBeforeEst,
+    tokens_after_est: args.tokensAfterEst,
+    savings_tokens_est: args.savingsTokensEst,
+    expected_cost_savings_est: args.expectedCostSavingsEst,
+    compactor_expected_cost_est: args.compactorExpectedCostEst,
+    compactor_cost_est: args.compactorCostEst,
+    compactor_timeout_ms: args.compactorTimeoutMs,
+    compactor_latency_ms: args.compactorLatencyMs,
+    compaction_reason: args.compactionReason,
+    compaction_attempted: args.compactionAttempted,
+    compaction_applied: args.compactionApplied,
+    compaction_skipped_reason: args.compactionSkippedReason,
+    compaction_error: args.compactionError,
     error: args.error
   };
 }
 
-function mustGetAdapter(route: 'llm.small' | 'llm.mid' | 'llm.big'): { model: string; adapter: 'openai' | 'ollama' } {
+interface ModelExecutionCandidate {
+  route: 'llm.small' | 'llm.mid' | 'llm.big';
+  provider: 'openai' | 'ollama';
+  model: string;
+  expected_cost_est: number;
+  context_window?: number;
+}
+
+function defaultRouteCandidate(route: 'llm.small' | 'llm.mid' | 'llm.big'): ModelExecutionCandidate {
   if (route === 'llm.small' && ollama && OLLAMA_MODEL) {
     const validation = isAllowedOllamaBaseUrl(OLLAMA_BASE_URL);
     if (!validation.ok) {
       throw new Error(`Ollama base URL blocked: ${validation.reason ?? 'invalid URL'}`);
     }
-    return { model: OLLAMA_MODEL, adapter: 'ollama' };
+    const pricing = findPricingEntry(pricingConfig, route, 'ollama', OLLAMA_MODEL);
+    return {
+      route,
+      provider: 'ollama',
+      model: OLLAMA_MODEL,
+      expected_cost_est: 0,
+      context_window: pricing?.context_window
+    };
   }
 
   if (!openai) {
     throw new Error('OpenAI not configured (missing OPENAI_API_KEY)');
   }
 
-  if (route === 'llm.small') {
-    return { model: OPENAI_SMALL_MODEL, adapter: 'openai' };
+  const model = route === 'llm.small' ? OPENAI_SMALL_MODEL : route === 'llm.mid' ? OPENAI_MID_MODEL : OPENAI_BIG_MODEL;
+  const pricing = findPricingEntry(pricingConfig, route, 'openai', model);
+  return {
+    route,
+    provider: 'openai',
+    model,
+    expected_cost_est: 0,
+    context_window: pricing?.context_window
+  };
+}
+
+function buildCandidatesForRoute(route: 'llm.small' | 'llm.mid' | 'llm.big', inputTokens: number, outputTokens: number): ModelExecutionCandidate[] {
+  const pricingCandidates = listRoutePricingCandidates(pricingConfig, route)
+    .map((entry) => ({
+      route,
+      provider: entry.provider,
+      model: entry.model,
+      expected_cost_est: expectedCostUSD(inputTokens, outputTokens, entry),
+      context_window: entry.context_window
+    }))
+    .filter((candidate) => !(candidate.provider === 'ollama' && !ollama));
+
+  if (pricingCandidates.length > 0) {
+    return pricingCandidates;
   }
-  if (route === 'llm.mid') {
-    return { model: OPENAI_MID_MODEL, adapter: 'openai' };
+
+  const fallback = defaultRouteCandidate(route);
+  const fallbackPrice = findPricingEntry(pricingConfig, route, fallback.provider, fallback.model);
+  return [
+    {
+      ...fallback,
+      expected_cost_est: expectedCostUSD(inputTokens, outputTokens, fallbackPrice),
+      context_window: fallbackPrice?.context_window
+    }
+  ];
+}
+
+function chooseCandidate(
+  route: 'llm.small' | 'llm.mid' | 'llm.big',
+  inputTokens: number,
+  outputTokens: number,
+  options?: { preferCheapest?: boolean }
+): {
+  selected: ModelExecutionCandidate;
+  candidateCosts: CostCandidate[];
+  chosenReason: 'cheapest_by_expected_cost' | 'policy_default';
+} {
+  const candidates = buildCandidatesForRoute(route, inputTokens, outputTokens);
+  if (candidates.length === 0) {
+    throw new Error(`No candidates available for route ${route}`);
   }
-  return { model: OPENAI_BIG_MODEL, adapter: 'openai' };
+  const candidateCosts: CostCandidate[] = candidates.map((candidate) => ({
+    route: candidate.route,
+    model: candidate.model,
+    provider: candidate.provider,
+    expected_cost_est: candidate.expected_cost_est
+  }))
+    .sort((a, b) => a.expected_cost_est - b.expected_cost_est);
+
+  const modelContextLimits = Object.fromEntries(candidates.map((c) => [c.model, c.context_window ?? 0]));
+  const chosenCheapest =
+    chooseCheapestReachableCandidate({
+      candidates: candidateCosts,
+      reachableModels,
+      inputTokens,
+      outputTokens,
+      modelContextLimits
+    }) ?? candidateCosts[0];
+  const defaultCandidate = defaultRouteCandidate(route);
+  const defaultChosen = candidateCosts.find((candidate) => candidate.model === defaultCandidate.model && candidate.provider === defaultCandidate.provider);
+  const defaultEligible =
+    defaultChosen &&
+    reachableModels.has(defaultChosen.model) &&
+    !((modelContextLimits[defaultChosen.model] ?? 0) > 0 && inputTokens + outputTokens > (modelContextLimits[defaultChosen.model] ?? 0))
+      ? defaultChosen
+      : undefined;
+
+  const selectedCost = options?.preferCheapest === false ? defaultEligible ?? chosenCheapest : chosenCheapest;
+  if (!selectedCost) {
+    throw new Error(`No cost candidate selected for route ${route}`);
+  }
+
+  const selected = candidates.find((candidate) => candidate.model === selectedCost.model && candidate.provider === selectedCost.provider) ?? candidates[0];
+  if (!selected) {
+    throw new Error(`Selected candidate not found for route ${route}`);
+  }
+  const chosenReason: 'cheapest_by_expected_cost' | 'policy_default' = options?.preferCheapest === false && defaultEligible ? 'policy_default' : 'cheapest_by_expected_cost';
+  return { selected, candidateCosts, chosenReason };
+}
+
+function estimateMaxOutputTokensForBudget(
+  budgetUsd: number,
+  inputTokens: number,
+  entry: { in_per_1m: number; out_per_1m: number }
+): number {
+  const inputCost = (inputTokens / 1_000_000) * entry.in_per_1m;
+  const remaining = budgetUsd - inputCost;
+  if (remaining <= 0) {
+    return 1;
+  }
+  if (entry.out_per_1m <= 0) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return Math.max(1, Math.floor((remaining * 1_000_000) / entry.out_per_1m));
+}
+
+function formatExpectedVsBudget(expectedCostEst: number, maxCostUsd?: number): string | undefined {
+  if (maxCostUsd === undefined) {
+    return undefined;
+  }
+  return `$${expectedCostEst.toFixed(6)} / $${maxCostUsd.toFixed(6)}`;
+}
+
+type BudgetAction = 'compacted' | 'reduced_output_tokens' | 'model_switched';
+
+function pushBudgetAction(actions: BudgetAction[], action: BudgetAction): BudgetAction[] {
+  return actions.includes(action) ? actions : [...actions, action];
 }
 
 async function runStartupDiagnostics(): Promise<void> {
   const report: DiagLine[] = [];
   const suggestions: string[] = [];
+  reachableModels.clear();
+  const missingPricingEntries: Array<{ route: 'llm.small' | 'llm.mid' | 'llm.big'; provider: 'openai' | 'ollama'; model: string }> = [];
 
   const openaiConfigured = Boolean(OPENAI_SMALL_MODEL || OPENAI_MID_MODEL || OPENAI_BIG_MODEL);
   const ollamaConfigured = Boolean(OLLAMA_BASE_URL && OLLAMA_MODEL);
@@ -430,6 +676,44 @@ async function runStartupDiagnostics(): Promise<void> {
   };
 
   addStartupLine(report, 'info', 'Startup diagnostics started', { port: PORT });
+  diagStatus.pricing = {
+    loaded: pricingLoad.loaded,
+    path: pricingLoad.path,
+    currency: pricingConfig.currency,
+    warnings: [...pricingLoad.warnings],
+    missing_entries: [],
+    example_cost_1k_in_1k_out: Object.values(pricingConfig.models).map((entry) => ({
+      route: entry.logical_route,
+      provider: entry.provider,
+      model: entry.model,
+      in_per_1m: entry.in_per_1m,
+      out_per_1m: entry.out_per_1m,
+      expected_cost_usd: expectedCostUSD(1000, 1000, entry)
+    }))
+  };
+
+  if (pricingLoad.warnings.length > 0) {
+    for (const warning of pricingLoad.warnings) {
+      addStartupLine(report, 'warn', 'Pricing config warning', { warning });
+      suggestions.push('Fix pricing config validation warnings and restart gateway.');
+    }
+  }
+  if (pricingLoad.loaded) {
+    addStartupLine(report, 'info', 'Pricing config loaded', {
+      currency: pricingConfig.currency,
+      entries: Object.keys(pricingConfig.models).length,
+      path: pricingLoad.path
+    });
+  } else {
+    addStartupLine(report, 'warn', 'Pricing config not loaded', {
+      path: pricingLoad.path
+    });
+  }
+  addStartupLine(report, 'info', 'Compactor configured', {
+    provider: COMPACTOR_PROVIDER,
+    model: COMPACTOR_MODEL,
+    base_url: COMPACTOR_PROVIDER === 'ollama' ? COMPACTOR_BASE_URL : undefined
+  });
 
   if (openaiConfigured) {
     addStartupLine(report, 'info', 'OpenAI backend configured', {
@@ -458,12 +742,18 @@ async function runStartupDiagnostics(): Promise<void> {
           suggestions.push('Verify OPENAI_API_KEY and outbound internet access for gateway container.');
         } else {
           diagStatus.backends.openai.reachable = true;
+          reachableModels.add(OPENAI_SMALL_MODEL);
+          reachableModels.add(OPENAI_MID_MODEL);
+          reachableModels.add(OPENAI_BIG_MODEL);
           addStartupLine(report, 'info', 'OpenAI probe succeeded', { probe: 'GET /v1/models' });
 
           const parsed = (await response.json()) as { data?: Array<{ id?: string }> };
           const ids = new Set((parsed.data ?? []).map((m) => m.id).filter((id): id is string => Boolean(id)));
           for (const modelName of [OPENAI_SMALL_MODEL, OPENAI_MID_MODEL, OPENAI_BIG_MODEL]) {
             const found = ids.has(modelName);
+            if (found) {
+              reachableModels.add(modelName);
+            }
             addStartupLine(report, found ? 'info' : 'warn', 'OpenAI model configured', {
               model: modelName,
               verified_in_models_list: found
@@ -512,6 +802,10 @@ async function runStartupDiagnostics(): Promise<void> {
         suggestions.push('Verify OLLAMA_BASE_URL is reachable from Docker (for Mac host use http://host.docker.internal:11434).');
       } else {
         diagStatus.backends.ollama.reachable = true;
+        if (OLLAMA_MODEL) {
+          reachableModels.add(OLLAMA_MODEL);
+          reachableModels.add(`${OLLAMA_MODEL}:latest`);
+        }
         addStartupLine(report, 'info', 'Ollama probe succeeded', { url: tagsUrl });
         const data = (await response.json()) as { models?: Array<{ name?: string }> };
         const names = (data.models ?? []).map((m) => m.name ?? '');
@@ -537,6 +831,53 @@ async function runStartupDiagnostics(): Promise<void> {
       info: 'Optional backend disabled. Set OLLAMA_BASE_URL and OLLAMA_MODEL to enable.'
     });
   }
+
+  const configuredModelChecks: Array<{ route: 'llm.small' | 'llm.mid' | 'llm.big'; provider: 'openai' | 'ollama'; model: string }> = [];
+  if (useOllamaSmall && OLLAMA_MODEL) {
+    configuredModelChecks.push({ route: 'llm.small', provider: 'ollama', model: OLLAMA_MODEL });
+  } else {
+    configuredModelChecks.push({ route: 'llm.small', provider: 'openai', model: OPENAI_SMALL_MODEL });
+  }
+  configuredModelChecks.push({ route: 'llm.mid', provider: 'openai', model: OPENAI_MID_MODEL });
+  configuredModelChecks.push({ route: 'llm.big', provider: 'openai', model: OPENAI_BIG_MODEL });
+
+  for (const check of configuredModelChecks) {
+    const pricingEntry = findPricingEntry(pricingConfig, check.route, check.provider, check.model);
+    const found = Boolean(pricingEntry);
+    addStartupLine(report, found ? 'info' : 'warn', 'Pricing entry check', {
+      route: check.route,
+      provider: check.provider,
+      model: check.model,
+      found
+    });
+    if (!found) {
+      missingPricingEntries.push(check);
+      suggestions.push(`Add pricing entry for ${check.route} (${check.provider}:${check.model}) in gateway/config/pricing.json.`);
+      continue;
+    }
+
+    if (check.provider === 'openai' && pricingEntry) {
+      const inDefined = pricingEntry.in_defined === true;
+      const outDefined = pricingEntry.out_defined === true;
+      if (!inDefined || !outDefined) {
+        addStartupLine(report, 'warn', 'OpenAI pricing entry missing in/out rate fields', {
+          route: check.route,
+          model: check.model,
+          in_defined: inDefined,
+          out_defined: outDefined
+        });
+      }
+      if (pricingEntry.in_per_1m < 0 || pricingEntry.out_per_1m < 0) {
+        addStartupLine(report, 'error', 'OpenAI pricing entry contains negative values', {
+          route: check.route,
+          model: check.model,
+          in_per_1m: pricingEntry.in_per_1m,
+          out_per_1m: pricingEntry.out_per_1m
+        });
+      }
+    }
+  }
+  diagStatus.pricing.missing_entries = missingPricingEntries;
 
   const missingEnv = [...diagStatus.backends.openai.missing_env, ...diagStatus.backends.ollama.missing_env];
   const openaiOk = !diagStatus.backends.openai.configured || diagStatus.backends.openai.reachable;
@@ -583,6 +924,7 @@ app.get('/v1/diag/status', async (request, reply) => {
   return {
     ok: diagStatus.ok,
     backends: diagStatus.backends,
+    pricing: diagStatus.pricing,
     last_startup_report: diagStatus.last_startup_report,
     suggestions: diagStatus.suggestions
   };
@@ -642,6 +984,19 @@ app.get<{ Querystring: { session_id?: string; limit?: string } }>('/v1/logs', as
   };
 });
 
+function buildAttemptPlan(route: RouterDecision['route']): Array<'tool.calculator' | 'llm.small' | 'llm.mid' | 'llm.big'> {
+  if (route === 'tool.calculator') {
+    return ['tool.calculator', 'llm.small', 'llm.mid', 'llm.big'];
+  }
+  if (route === 'llm.small') {
+    return ['llm.small', 'llm.mid', 'llm.big'];
+  }
+  if (route === 'llm.mid') {
+    return ['llm.mid', 'llm.big'];
+  }
+  return ['llm.big'];
+}
+
 app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
   const start = Date.now();
   const requestId = crypto.randomUUID();
@@ -649,6 +1004,9 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
   const body = request.body;
   const messages = body?.messages;
   const stream = Boolean(body?.stream);
+  const maxCostUsd = Number.isFinite(Number(body?.max_cost_usd)) && Number(body?.max_cost_usd) > 0 ? Number(body?.max_cost_usd) : undefined;
+  const preferCheapest = body?.prefer_cheapest !== false;
+  const verbosity: 'brief' | 'normal' | 'detailed' = body?.verbosity === 'brief' || body?.verbosity === 'detailed' ? body.verbosity : 'normal';
   const key = clientKey({ ip: request.ip, headers: request.headers as Record<string, unknown> });
   if (!checkRateLimit(`chat:${stream ? 'stream' : 'sync'}:${key}`, stream ? RATE_LIMIT_SSE_MAX : RATE_LIMIT_CHAT_MAX)) {
     reply.code(429);
@@ -668,27 +1026,61 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
     reply.code(400);
     return { error: `messages exceeds maximum of ${MAX_MESSAGES}` };
   }
-  const hasInvalidMessage = messages.some(
-    (m) => !m || typeof m.content !== 'string' || !['system', 'user', 'assistant'].includes(m.role) || m.content.length > MAX_CONTENT_CHARS
-  );
-  if (hasInvalidMessage) {
+  const shapeCheck = validateMessageShape(messages, MAX_CONTENT_CHARS);
+  if (!shapeCheck.ok && shapeCheck.error === 'invalid message format') {
     reply.code(400);
-    return { error: `invalid message format or content too large (max ${MAX_CONTENT_CHARS} chars)` };
+    return { error: 'invalid message format' };
+  }
+  if (!shapeCheck.ok && shapeCheck.error === 'user_message_too_large') {
+    reply.code(413);
+    return { error: 'User message exceeds maximum content length', max_content_chars: MAX_CONTENT_CHARS };
+  }
+
+  const charMetrics = computeRequestCharMetrics(messages);
+  if (exceedsMaxRequestChars(charMetrics, MAX_REQUEST_CHARS)) {
+    reply.code(413);
+    return { error: 'Request exceeds maximum total character length', max_request_chars: MAX_REQUEST_CHARS };
   }
 
   const userText = getLastUser(messages);
   const userExcerpt = userText.slice(0, 150);
-  const inputChars = messages.reduce((sum, m) => sum + m.content.length, 0);
+  const inputCharsUser = charMetrics.user_chars;
+  const inputCharsIncomingTotal = charMetrics.incoming_total_chars;
+  const inputTokensEstBase = estimateInputTokens(messages, 'openai');
 
   let route = 'unknown';
   let modelUsed = 'unknown';
   let confidence = 0;
   let reason = '';
-  let fallbackRoute: RouterDecision['fallback_route'];
+  let fallbackRoute: RouterDecision['fallback_route'] = undefined;
   let fallbackUsed = false;
   let toolUsed = false;
   let error: string | null = null;
   let finalContent = '';
+  let inputTokensEst = inputTokensEstBase;
+  let outputTokensEst = 0;
+  let expectedCostEst = 0;
+  let candidateCosts: CostCandidate[] = [];
+  let chosenReason: 'cheapest_by_expected_cost' | 'policy_default' | undefined;
+  let budgetActions: Array<'compacted' | 'reduced_output_tokens' | 'model_switched'> = [];
+  let expectedCostVsBudget: string | undefined;
+  let actualUsage: TokenUsage | undefined;
+  let actualCost: number | undefined;
+  let compacted = false;
+  let tokensBeforeEst = inputTokensEstBase;
+  let tokensAfterEst = inputTokensEstBase;
+  let savingsTokensEst = 0;
+  let expectedCostSavingsEst = 0;
+  let compactorExpectedCostEst = 0;
+  let compactorCostEst = 0;
+  let compactorTimeoutMs = COMPACTOR_TIMEOUT_MS;
+  let compactorLatencyMs: number | undefined;
+  let compactionReason: 'over_budget' | 'worth_it' | undefined;
+  let compactionAttempted = false;
+  let compactionApplied = false;
+  let compactionSkippedReason: 'skipped_threshold' | 'tool_route' | 'code_edit_preserve' | undefined;
+  let compactionError: string | undefined;
+  let outgoingInputCharsTotal = inputCharsIncomingTotal;
 
   try {
     const session = getSession(sessionId);
@@ -699,16 +1091,63 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
     reason = decision.reason;
     fallbackRoute = decision.fallback_route;
     let effectiveDecision: RouterDecision = { ...decision };
+    const attemptPlan = buildAttemptPlan(decision.route);
+    const baseMessages = buildMessages(messages, session);
 
-    let effectiveRoute: RouterDecision['route'] = decision.route;
-    let effectiveMessages = buildMessages(messages, session);
-
-    if (effectiveRoute === 'tool.calculator') {
+    if (attemptPlan[0] === 'tool.calculator') {
       try {
         finalContent = evaluateMath(userText);
         toolUsed = true;
+        route = 'tool.calculator';
+        modelUsed = 'tool.calculator';
+        outputTokensEst = 0;
+        inputTokensEst = 0;
+        expectedCostEst = 0;
+        candidateCosts = [];
+        chosenReason = undefined;
+        compacted = false;
+        tokensBeforeEst = 0;
+        tokensAfterEst = 0;
+        savingsTokensEst = 0;
+        expectedCostSavingsEst = 0;
+        compactorExpectedCostEst = 0;
+        compactorCostEst = 0;
+        compactorTimeoutMs = 0;
+        compactorLatencyMs = 0;
+        compactionReason = undefined;
+        compactionAttempted = false;
+        compactionApplied = false;
+        compactionSkippedReason = 'tool_route';
+        compactionError = undefined;
+        expectedCostVsBudget = formatExpectedVsBudget(0, maxCostUsd);
+        effectiveDecision = {
+          ...effectiveDecision,
+          route: 'tool.calculator',
+          model: 'tool.calculator',
+          input_tokens_est: 0,
+          output_tokens_est: 0,
+          expected_cost_est: 0,
+          candidate_costs: [],
+          chosen_reason: undefined,
+          max_cost_usd: maxCostUsd,
+          budget_actions: [],
+          expected_cost_vs_budget: expectedCostVsBudget,
+          compacted: false,
+          tokens_before_est: 0,
+          tokens_after_est: 0,
+          savings_tokens_est: 0,
+          expected_cost_savings_est: 0,
+          compactor_expected_cost_est: 0,
+          compactor_cost_est: 0,
+          compactor_timeout_ms: 0,
+          compactor_latency_ms: 0,
+          compaction_attempted: false,
+          compaction_applied: false,
+          compaction_skipped_reason: 'tool_route'
+        };
 
-        const usage: Usage = { input_chars: inputChars, output_chars: finalContent.length };
+        outgoingInputCharsTotal = inputCharsIncomingTotal;
+        const usage = makeUsage(inputCharsUser, outgoingInputCharsTotal, finalContent.length);
         const latencyMs = Date.now() - start;
         persistSession(sessionId, route, modelUsed, userText, finalContent);
 
@@ -728,10 +1167,52 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
             confidence,
             reason,
             fallback_route: fallbackRoute,
-            tool_used: true
+            tool_used: true,
+            input_tokens_est: inputTokensEst,
+            output_tokens_est: outputTokensEst,
+            expected_cost_est: expectedCostEst,
+            candidate_costs: candidateCosts,
+            chosen_reason: chosenReason,
+            max_cost_usd: maxCostUsd,
+            budget_actions: budgetActions,
+            expected_cost_vs_budget: expectedCostVsBudget,
+            compacted,
+            tokens_before_est: tokensBeforeEst,
+            tokens_after_est: tokensAfterEst,
+            savings_tokens_est: savingsTokensEst,
+            expected_cost_savings_est: expectedCostSavingsEst,
+            compactor_expected_cost_est: compactorExpectedCostEst,
+            compactor_cost_est: compactorCostEst,
+            compactor_timeout_ms: compactorTimeoutMs,
+            compactor_latency_ms: compactorLatencyMs,
+            compaction_reason: compactionReason,
+            compaction_attempted: compactionAttempted,
+            compaction_applied: compactionApplied,
+            compaction_skipped_reason: compactionSkippedReason,
+            compaction_error: compactionError
           });
           safeSseWrite(reply.raw, 'token', { delta: finalContent });
-          safeSseWrite(reply.raw, 'done', { content: finalContent, usage, latency_ms: latencyMs });
+          safeSseWrite(reply.raw, 'done', {
+            content: finalContent,
+            usage,
+            latency_ms: latencyMs,
+            actual_usage: actualUsage,
+            actual_cost: actualCost,
+            compacted,
+            tokens_before_est: tokensBeforeEst,
+            tokens_after_est: tokensAfterEst,
+            savings_tokens_est: savingsTokensEst,
+            expected_cost_savings_est: expectedCostSavingsEst,
+            compactor_expected_cost_est: compactorExpectedCostEst,
+            compactor_cost_est: compactorCostEst,
+            compactor_timeout_ms: compactorTimeoutMs,
+            compactor_latency_ms: compactorLatencyMs,
+            compaction_reason: compactionReason,
+            compaction_attempted: compactionAttempted,
+            compaction_applied: compactionApplied,
+            compaction_skipped_reason: compactionSkippedReason,
+            compaction_error: compactionError
+          });
           reply.raw.end();
           chatStreamClients.delete(reply.raw);
         } else {
@@ -743,7 +1224,6 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
             latency_ms: latencyMs,
             decision: effectiveDecision
           };
-
           pushLog(
             makeLogEntry({
               requestId,
@@ -757,10 +1237,33 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
               toolUsed,
               latencyMs,
               usage,
+              inputTokensEst,
+              outputTokensEst,
+              expectedCostEst,
+              candidateCosts,
+              chosenReason,
+              maxCostUsd,
+              budgetActions,
+              expectedCostVsBudget,
+              actualUsage,
+              actualCost,
+              compacted,
+              tokensBeforeEst,
+              tokensAfterEst,
+              savingsTokensEst,
+              expectedCostSavingsEst,
+              compactorExpectedCostEst,
+              compactorCostEst,
+              compactorTimeoutMs,
+              compactorLatencyMs,
+              compactionReason,
+              compactionAttempted,
+              compactionApplied,
+              compactionSkippedReason,
+              compactionError,
               error
             })
           );
-
           return payload;
         }
 
@@ -777,121 +1280,434 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
             toolUsed,
             latencyMs,
             usage,
+            inputTokensEst,
+            outputTokensEst,
+            expectedCostEst,
+            candidateCosts,
+            chosenReason,
+            maxCostUsd,
+            budgetActions,
+            expectedCostVsBudget,
+            actualUsage,
+            actualCost,
+            compacted,
+            tokensBeforeEst,
+            tokensAfterEst,
+            savingsTokensEst,
+            expectedCostSavingsEst,
+            compactorExpectedCostEst,
+            compactorCostEst,
+            compactorTimeoutMs,
+            compactorLatencyMs,
+            compactionReason,
+            compactionAttempted,
+            compactionApplied,
+            compactionSkippedReason,
+            compactionError,
             error
           })
         );
-
         return reply;
       } catch {
-        effectiveRoute = 'llm.small';
-        route = 'llm.small';
         fallbackUsed = true;
-        const fallback = mustGetAdapter('llm.small');
-        modelUsed = fallback.model;
         reason = `${reason} Calculator parse failed; fell back to llm.small.`;
-        effectiveDecision = {
-          route: 'llm.small',
-          confidence,
-          reason,
-          model: fallback.model,
-          fallback_route: fallbackRoute
-        };
-        effectiveMessages = buildMessages(
-          [
-            {
-              role: 'system',
-              content: 'Solve the user math question. Return only the answer followed by brief steps.'
-            },
-            ...messages
-          ],
-          session
-        );
       }
     }
 
-    const llm = mustGetAdapter(effectiveRoute as 'llm.small' | 'llm.mid' | 'llm.big');
-    modelUsed = llm.model;
-    if (!fallbackUsed) {
-      effectiveDecision = {
-        ...effectiveDecision,
-        route: effectiveRoute,
-        model: llm.model
-      };
-    }
+    let completionUsage = makeUsage(inputCharsUser, outgoingInputCharsTotal, 0);
+    let llmSucceeded = false;
+    const llmStages = attemptPlan.filter((step): step is 'llm.small' | 'llm.mid' | 'llm.big' => step !== 'tool.calculator');
 
-    if (stream) {
-      reply.hijack();
-      chatStreamClients.add(reply.raw);
-      request.raw.on('close', () => {
-        chatStreamClients.delete(reply.raw);
+    for (let stageIndex = 0; stageIndex < llmStages.length; stageIndex += 1) {
+      const stageRoute = llmStages[stageIndex] as 'llm.small' | 'llm.mid' | 'llm.big';
+      const stageBaseMessages =
+        decision.route === 'tool.calculator' && stageRoute === 'llm.small'
+          ? buildMessages(
+              [
+                {
+                  role: 'system',
+                  content: 'Solve the user math question. Return only the answer followed by brief steps.'
+                },
+                ...messages
+              ],
+              session
+            )
+          : baseMessages;
+
+      outputTokensEst = estimateOutputTokens(stageBaseMessages, stageRoute, verbosity);
+      const preInputTokensEst = estimateInputTokens(stageBaseMessages, 'openai');
+      const preSelected = chooseCandidate(stageRoute, preInputTokensEst, outputTokensEst, { preferCheapest });
+      const prePricing = findPricingEntry(pricingConfig, stageRoute, preSelected.selected.provider, preSelected.selected.model);
+      const compaction = await maybeCompactContext({
+        route: stageRoute,
+        messages: stageBaseMessages,
+        limits: {
+          keepLastTurns: COMPACT_KEEP_LAST_TURNS,
+          keepLastLogLines: COMPACT_KEEP_LAST_LOG_LINES,
+          minSavingsTokens:
+            maxCostUsd !== undefined && preSelected.selected.expected_cost_est > maxCostUsd
+              ? 1
+              : COMPACT_MIN_SAVINGS_TOKENS,
+          outputTargetTokens: COMPACTOR_OUTPUT_TOKENS_EST,
+          maxLatencyMs: COMPACTOR_TIMEOUT_MS
+        },
+        budgets: {
+          tool: MAX_INPUT_TOKENS_TOOL,
+          math: MAX_INPUT_TOKENS_MATH,
+          mid: MAX_INPUT_TOKENS_MID,
+          big: MAX_INPUT_TOKENS_BIG
+        },
+        downstreamInputPricePer1M: prePricing?.in_per_1m ?? 0,
+        estimatorFamily: preSelected.selected.provider === 'openai' ? 'openai' : 'ollama',
+        compactorConfig: {
+          provider: COMPACTOR_PROVIDER,
+          model: COMPACTOR_MODEL,
+          baseUrl: COMPACTOR_BASE_URL,
+          openaiApiKey: OPENAI_API_KEY
+        },
+        compactorPricing: findPricingByProviderModel(pricingConfig, COMPACTOR_PROVIDER, COMPACTOR_MODEL)
       });
-      reply.raw.writeHead(200, sseHeaders(request.headers.origin));
+      const stageMessages = compaction.messages;
+      outgoingInputCharsTotal = stageMessages.reduce((sum, m) => sum + m.content.length, 0);
+      compacted = compaction.telemetry.compacted;
+      tokensBeforeEst = compaction.telemetry.tokens_before_est;
+      tokensAfterEst = compaction.telemetry.tokens_after_est;
+      savingsTokensEst = compaction.telemetry.savings_tokens_est;
+      expectedCostSavingsEst = compaction.telemetry.expected_cost_savings_est;
+      compactorExpectedCostEst = compaction.telemetry.compactor_expected_cost_est;
+      compactorCostEst = compaction.telemetry.compactor_cost_est;
+      compactorTimeoutMs = compaction.telemetry.compactor_timeout_ms;
+      compactorLatencyMs = compaction.telemetry.compactor_latency_ms;
+      compactionReason = compaction.telemetry.compaction_reason;
+      compactionAttempted = compaction.telemetry.compaction_attempted;
+      compactionApplied = compaction.telemetry.compaction_applied;
+      compactionSkippedReason = compaction.telemetry.compaction_skipped_reason;
+      compactionError = compaction.telemetry.compaction_error;
 
-      safeSseWrite(reply.raw, 'meta', {
-        request_id: requestId,
-        session_id: sessionId,
-        route,
-        model_used: modelUsed,
-        confidence,
-        reason,
-        fallback_route: fallbackRoute,
-        tool_used: toolUsed
-      });
+      const routeFamily = preSelected.selected.provider === 'openai' ? 'openai' : 'ollama';
+      inputTokensEst = estimateInputTokens(stageMessages, routeFamily);
+      tokensAfterEst = inputTokensEst;
+      savingsTokensEst = Math.max(0, tokensBeforeEst - tokensAfterEst);
+      expectedCostSavingsEst = (savingsTokensEst / 1_000_000) * (prePricing?.in_per_1m ?? 0);
+      if (compactionApplied) {
+        budgetActions = pushBudgetAction(budgetActions, 'compacted');
+      }
 
-      const streamSource =
-        llm.adapter === 'ollama'
-          ? (ollama as OllamaAdapter).stream(effectiveMessages, llm.model)
-          : (openai as OpenAIAdapter).stream(effectiveMessages, llm.model);
+      let selectedForStage = chooseCandidate(stageRoute, inputTokensEst, outputTokensEst, { preferCheapest });
+      candidateCosts = selectedForStage.candidateCosts;
+      chosenReason = selectedForStage.chosenReason;
+      let llm = selectedForStage.selected;
+      expectedCostEst = llm.expected_cost_est;
 
-      for await (const delta of streamSource) {
-        finalContent += delta;
-        if (!safeSseWrite(reply.raw, 'token', { delta })) {
-          break;
+      if (maxCostUsd !== undefined && expectedCostEst > maxCostUsd) {
+        const pricingForSelected = findPricingEntry(pricingConfig, stageRoute, llm.provider, llm.model);
+        if (pricingForSelected) {
+          const reducedOutputTokens = estimateMaxOutputTokensForBudget(maxCostUsd, inputTokensEst, pricingForSelected);
+          if (reducedOutputTokens < outputTokensEst) {
+            outputTokensEst = Math.max(1, reducedOutputTokens);
+            budgetActions = pushBudgetAction(budgetActions, 'reduced_output_tokens');
+            selectedForStage = chooseCandidate(stageRoute, inputTokensEst, outputTokensEst, { preferCheapest: true });
+            candidateCosts = selectedForStage.candidateCosts;
+            chosenReason = selectedForStage.chosenReason;
+            llm = selectedForStage.selected;
+            expectedCostEst = llm.expected_cost_est;
+          }
+        }
+
+        if (expectedCostEst > maxCostUsd) {
+          const cheapestAfterReduction = chooseCandidate(stageRoute, inputTokensEst, outputTokensEst, { preferCheapest: true });
+          if (cheapestAfterReduction.selected.model !== llm.model || cheapestAfterReduction.selected.provider !== llm.provider) {
+            budgetActions = pushBudgetAction(budgetActions, 'model_switched');
+          }
+          selectedForStage = cheapestAfterReduction;
+          candidateCosts = selectedForStage.candidateCosts;
+          chosenReason = selectedForStage.chosenReason;
+          llm = selectedForStage.selected;
+          expectedCostEst = llm.expected_cost_est;
         }
       }
 
-      const usage: Usage = { input_chars: inputChars, output_chars: finalContent.length };
-      const latencyMs = Date.now() - start;
-      persistSession(sessionId, route, modelUsed, userText, finalContent);
-      safeSseWrite(reply.raw, 'done', { content: finalContent, usage, latency_ms: latencyMs });
-      reply.raw.end();
-      chatStreamClients.delete(reply.raw);
+      expectedCostVsBudget = formatExpectedVsBudget(expectedCostEst, maxCostUsd);
+      route = stageRoute;
+      modelUsed = llm.model;
 
-      pushLog(
-        makeLogEntry({
-          requestId,
-          sessionId,
-          userExcerpt,
-          route,
-          modelUsed,
-          confidence,
-          reason,
-          fallbackUsed,
-          toolUsed,
-          latencyMs,
-          usage,
-          error
-        })
-      );
+      if (stageIndex > 0 || decision.route === 'tool.calculator') {
+        fallbackUsed = true;
+      }
 
-      return reply;
+      effectiveDecision = {
+        ...effectiveDecision,
+        route: stageRoute,
+        model: llm.model,
+        reason,
+        input_tokens_est: inputTokensEst,
+        output_tokens_est: outputTokensEst,
+        expected_cost_est: expectedCostEst,
+        candidate_costs: candidateCosts,
+        chosen_reason: chosenReason,
+        max_cost_usd: maxCostUsd,
+        budget_actions: budgetActions,
+        expected_cost_vs_budget: expectedCostVsBudget,
+        compacted,
+        tokens_before_est: tokensBeforeEst,
+        tokens_after_est: tokensAfterEst,
+        savings_tokens_est: savingsTokensEst,
+        expected_cost_savings_est: expectedCostSavingsEst,
+        compactor_expected_cost_est: compactorExpectedCostEst,
+        compactor_cost_est: compactorCostEst,
+        compactor_timeout_ms: compactorTimeoutMs,
+        compactor_latency_ms: compactorLatencyMs,
+        compaction_reason: compactionReason,
+        compaction_attempted: compactionAttempted,
+        compaction_applied: compactionApplied,
+        compaction_skipped_reason: compactionSkippedReason,
+        compaction_error: compactionError
+      };
+
+      if (maxCostUsd !== undefined && expectedCostEst > maxCostUsd) {
+        const suggestions = [
+          'Increase max_cost_usd for this request.',
+          'Set verbosity="brief" to lower output token target.',
+          'Use a shorter prompt/context to reduce input tokens.'
+        ];
+        const budgetError = {
+          error: 'Request exceeds max_cost_usd for available in-tier candidates',
+          request_id: requestId,
+          expected_cost_est: expectedCostEst,
+          max_cost_usd: maxCostUsd,
+          route: stageRoute,
+          suggestions
+        };
+        pushLog(
+          makeLogEntry({
+            requestId,
+            sessionId,
+            userExcerpt,
+            route: stageRoute,
+            modelUsed: llm.model,
+            confidence,
+            reason,
+            fallbackUsed,
+            toolUsed,
+            latencyMs: Date.now() - start,
+            usage: makeUsage(inputCharsUser, outgoingInputCharsTotal, finalContent.length),
+            inputTokensEst,
+            outputTokensEst,
+            expectedCostEst,
+            candidateCosts,
+            chosenReason,
+            maxCostUsd,
+            budgetActions,
+            expectedCostVsBudget,
+            actualUsage,
+            actualCost,
+            compacted,
+            tokensBeforeEst,
+            tokensAfterEst,
+            savingsTokensEst,
+            expectedCostSavingsEst,
+            compactorExpectedCostEst,
+            compactorCostEst,
+            compactorTimeoutMs,
+            compactorLatencyMs,
+            compactionReason,
+            compactionAttempted,
+            compactionApplied,
+            compactionSkippedReason,
+            compactionError,
+            error: budgetError.error
+          })
+        );
+        reply.code(422);
+        return budgetError;
+      }
+
+      try {
+        if (stream) {
+          reply.hijack();
+          chatStreamClients.add(reply.raw);
+          request.raw.on('close', () => {
+            chatStreamClients.delete(reply.raw);
+          });
+          reply.raw.writeHead(200, sseHeaders(request.headers.origin));
+
+          safeSseWrite(reply.raw, 'meta', {
+            request_id: requestId,
+            session_id: sessionId,
+            route,
+            model_used: modelUsed,
+            confidence,
+            reason,
+            fallback_route: fallbackRoute,
+            tool_used: toolUsed,
+            input_tokens_est: inputTokensEst,
+            output_tokens_est: outputTokensEst,
+            expected_cost_est: expectedCostEst,
+            candidate_costs: candidateCosts,
+            chosen_reason: chosenReason,
+            max_cost_usd: maxCostUsd,
+            budget_actions: budgetActions,
+            expected_cost_vs_budget: expectedCostVsBudget,
+            compacted,
+            tokens_before_est: tokensBeforeEst,
+            tokens_after_est: tokensAfterEst,
+            savings_tokens_est: savingsTokensEst,
+            expected_cost_savings_est: expectedCostSavingsEst,
+            compactor_expected_cost_est: compactorExpectedCostEst,
+            compactor_cost_est: compactorCostEst,
+            compactor_timeout_ms: compactorTimeoutMs,
+            compactor_latency_ms: compactorLatencyMs,
+            compaction_reason: compactionReason,
+            compaction_attempted: compactionAttempted,
+            compaction_applied: compactionApplied,
+            compaction_skipped_reason: compactionSkippedReason,
+            compaction_error: compactionError
+          });
+
+          const streamSource =
+            llm.provider === 'ollama'
+              ? (ollama as OllamaAdapter).stream(stageMessages, llm.model, (usage) => {
+                  actualUsage = usage;
+                }, { max_output_tokens: outputTokensEst })
+              : (openai as OpenAIAdapter).stream(stageMessages, llm.model, (usage) => {
+                  actualUsage = usage;
+                }, { max_output_tokens: outputTokensEst });
+
+          for await (const delta of streamSource) {
+            finalContent += delta;
+            if (!safeSseWrite(reply.raw, 'token', { delta })) {
+              break;
+            }
+          }
+
+          completionUsage = makeUsage(inputCharsUser, outgoingInputCharsTotal, finalContent.length);
+          const pricing = findPricingEntry(pricingConfig, stageRoute, llm.provider, llm.model);
+          if (actualUsage?.input_tokens !== undefined && actualUsage?.output_tokens !== undefined) {
+            actualCost = expectedCostUSD(actualUsage.input_tokens, actualUsage.output_tokens, pricing);
+          }
+          const latencyMs = Date.now() - start;
+          persistSession(sessionId, route, modelUsed, userText, finalContent);
+          safeSseWrite(reply.raw, 'done', {
+            content: finalContent,
+            usage: completionUsage,
+            latency_ms: latencyMs,
+            actual_usage: actualUsage,
+            actual_cost: actualCost,
+            compacted,
+            tokens_before_est: tokensBeforeEst,
+            tokens_after_est: tokensAfterEst,
+            savings_tokens_est: savingsTokensEst,
+            expected_cost_savings_est: expectedCostSavingsEst,
+            compactor_expected_cost_est: compactorExpectedCostEst,
+            compactor_cost_est: compactorCostEst,
+            compactor_timeout_ms: compactorTimeoutMs,
+            compactor_latency_ms: compactorLatencyMs,
+            compaction_reason: compactionReason,
+            compaction_attempted: compactionAttempted,
+            compaction_applied: compactionApplied,
+            compaction_skipped_reason: compactionSkippedReason,
+            compaction_error: compactionError
+          });
+          reply.raw.end();
+          chatStreamClients.delete(reply.raw);
+
+          pushLog(
+            makeLogEntry({
+              requestId,
+              sessionId,
+              userExcerpt,
+              route,
+              modelUsed,
+              confidence,
+              reason,
+              fallbackUsed,
+              toolUsed,
+              latencyMs,
+              usage: completionUsage,
+              inputTokensEst,
+              outputTokensEst,
+              expectedCostEst,
+              candidateCosts,
+              chosenReason,
+              maxCostUsd,
+              budgetActions,
+              expectedCostVsBudget,
+              actualUsage,
+              actualCost,
+              compacted,
+              tokensBeforeEst,
+              tokensAfterEst,
+              savingsTokensEst,
+              expectedCostSavingsEst,
+              compactorExpectedCostEst,
+              compactorCostEst,
+              compactorTimeoutMs,
+              compactorLatencyMs,
+              compactionReason,
+              compactionAttempted,
+              compactionApplied,
+              compactionSkippedReason,
+              compactionError,
+              error
+            })
+          );
+          return reply;
+        }
+
+        const completion =
+          llm.provider === 'ollama'
+            ? await (ollama as OllamaAdapter).complete(stageMessages, llm.model, { max_output_tokens: outputTokensEst })
+            : await (openai as OpenAIAdapter).complete(stageMessages, llm.model, { max_output_tokens: outputTokensEst });
+
+        finalContent = completion.content;
+        completionUsage = makeUsage(inputCharsUser, outgoingInputCharsTotal, finalContent.length);
+        actualUsage = completion.token_usage;
+        const pricing = findPricingEntry(pricingConfig, stageRoute, llm.provider, llm.model);
+        if (actualUsage?.input_tokens !== undefined && actualUsage?.output_tokens !== undefined) {
+          actualCost = expectedCostUSD(actualUsage.input_tokens, actualUsage.output_tokens, pricing);
+        }
+        llmSucceeded = true;
+        break;
+      } catch (candidateErr) {
+        reason = `${reason} Candidate ${llm.model} failed (${truncateError(candidateErr instanceof Error ? candidateErr.message : 'error')}).`;
+      }
     }
 
-    const completion =
-      llm.adapter === 'ollama'
-        ? await (ollama as OllamaAdapter).complete(effectiveMessages, llm.model)
-        : await (openai as OpenAIAdapter).complete(effectiveMessages, llm.model);
+    if (!llmSucceeded && !stream) {
+      throw new Error('No reachable model candidate succeeded.');
+    }
 
-    finalContent = completion.content;
-    const usage = completion.usage ?? { input_chars: inputChars, output_chars: finalContent.length };
     const latencyMs = Date.now() - start;
     persistSession(sessionId, route, modelUsed, userText, finalContent);
+    effectiveDecision = {
+      ...effectiveDecision,
+      actual_usage: actualUsage,
+      actual_cost: actualCost,
+      chosen_reason: chosenReason,
+      max_cost_usd: maxCostUsd,
+      budget_actions: budgetActions,
+      expected_cost_vs_budget: expectedCostVsBudget,
+      compacted,
+      tokens_before_est: tokensBeforeEst,
+      tokens_after_est: tokensAfterEst,
+      savings_tokens_est: savingsTokensEst,
+      expected_cost_savings_est: expectedCostSavingsEst,
+      compactor_expected_cost_est: compactorExpectedCostEst,
+      compactor_cost_est: compactorCostEst,
+      compactor_timeout_ms: compactorTimeoutMs,
+      compactor_latency_ms: compactorLatencyMs,
+      compaction_reason: compactionReason,
+      compaction_attempted: compactionAttempted,
+      compaction_applied: compactionApplied,
+      compaction_skipped_reason: compactionSkippedReason,
+      compaction_error: compactionError
+    };
 
     const response: ChatJsonResponse = {
       model_used: modelUsed,
       route,
       content: finalContent,
-      usage,
+      usage: completionUsage,
       latency_ms: latencyMs,
       decision: effectiveDecision
     };
@@ -908,7 +1724,31 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
         fallbackUsed,
         toolUsed,
         latencyMs,
-        usage,
+        usage: completionUsage,
+        inputTokensEst,
+        outputTokensEst,
+        expectedCostEst,
+        candidateCosts,
+        chosenReason,
+        maxCostUsd,
+        budgetActions,
+        expectedCostVsBudget,
+        actualUsage,
+        actualCost,
+        compacted,
+        tokensBeforeEst,
+        tokensAfterEst,
+        savingsTokensEst,
+        expectedCostSavingsEst,
+        compactorExpectedCostEst,
+        compactorCostEst,
+        compactorTimeoutMs,
+        compactorLatencyMs,
+        compactionReason,
+        compactionAttempted,
+        compactionApplied,
+        compactionSkippedReason,
+        compactionError,
         error
       })
     );
@@ -918,7 +1758,7 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
     const message = err instanceof Error ? err.message : 'Unknown error';
     error = truncateError(message);
     const latencyMs = Date.now() - start;
-    const usage: Usage = { input_chars: inputChars, output_chars: finalContent.length };
+    const usage = makeUsage(inputCharsUser, outgoingInputCharsTotal, finalContent.length);
 
     pushLog(
       makeLogEntry({
@@ -933,6 +1773,30 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
         toolUsed,
         latencyMs,
         usage,
+        inputTokensEst,
+        outputTokensEst,
+        expectedCostEst,
+        candidateCosts,
+        chosenReason,
+        maxCostUsd,
+        budgetActions,
+        expectedCostVsBudget,
+        actualUsage,
+        actualCost,
+        compacted,
+        tokensBeforeEst,
+        tokensAfterEst,
+        savingsTokensEst,
+        expectedCostSavingsEst,
+        compactorExpectedCostEst,
+        compactorCostEst,
+        compactorTimeoutMs,
+        compactorLatencyMs,
+        compactionReason,
+        compactionAttempted,
+        compactionApplied,
+        compactionSkippedReason,
+        compactionError,
         error
       })
     );
@@ -952,9 +1816,51 @@ app.post<{ Body: ChatRequestBody }>('/v1/chat', async (request, reply) => {
         confidence,
         reason,
         fallback_route: fallbackRoute,
-        tool_used: toolUsed
+        tool_used: toolUsed,
+        input_tokens_est: inputTokensEst,
+        output_tokens_est: outputTokensEst,
+        expected_cost_est: expectedCostEst,
+        candidate_costs: candidateCosts,
+        chosen_reason: chosenReason,
+        max_cost_usd: maxCostUsd,
+        budget_actions: budgetActions,
+        expected_cost_vs_budget: expectedCostVsBudget,
+        compacted,
+        tokens_before_est: tokensBeforeEst,
+        tokens_after_est: tokensAfterEst,
+        savings_tokens_est: savingsTokensEst,
+        expected_cost_savings_est: expectedCostSavingsEst,
+        compactor_expected_cost_est: compactorExpectedCostEst,
+        compactor_cost_est: compactorCostEst,
+        compactor_timeout_ms: compactorTimeoutMs,
+        compactor_latency_ms: compactorLatencyMs,
+        compaction_reason: compactionReason,
+        compaction_attempted: compactionAttempted,
+        compaction_applied: compactionApplied,
+        compaction_skipped_reason: compactionSkippedReason,
+        compaction_error: compactionError
       });
-      safeSseWrite(reply.raw, 'done', { content: finalContent, usage, latency_ms: latencyMs });
+      safeSseWrite(reply.raw, 'done', {
+        content: finalContent,
+        usage,
+        latency_ms: latencyMs,
+        actual_usage: actualUsage,
+        actual_cost: actualCost,
+        compacted,
+        tokens_before_est: tokensBeforeEst,
+        tokens_after_est: tokensAfterEst,
+        savings_tokens_est: savingsTokensEst,
+        expected_cost_savings_est: expectedCostSavingsEst,
+        compactor_expected_cost_est: compactorExpectedCostEst,
+        compactor_cost_est: compactorCostEst,
+        compactor_timeout_ms: compactorTimeoutMs,
+        compactor_latency_ms: compactorLatencyMs,
+        compaction_reason: compactionReason,
+        compaction_attempted: compactionAttempted,
+        compaction_applied: compactionApplied,
+        compaction_skipped_reason: compactionSkippedReason,
+        compaction_error: compactionError
+      });
       reply.raw.end();
       chatStreamClients.delete(reply.raw);
       return reply;

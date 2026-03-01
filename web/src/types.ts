@@ -6,8 +6,22 @@ export interface Message {
 }
 
 export interface Usage {
+  input_chars_user: number;
+  input_chars_total: number;
   input_chars: number;
   output_chars: number;
+}
+
+export interface TokenUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
+export interface CandidateCost {
+  route: 'llm.small' | 'llm.mid' | 'llm.big';
+  provider: 'openai' | 'ollama';
+  model: string;
+  expected_cost_est: number;
 }
 
 export interface DecisionMeta {
@@ -19,6 +33,28 @@ export interface DecisionMeta {
   reason: string;
   fallback_route?: string;
   tool_used: boolean;
+  input_tokens_est?: number;
+  output_tokens_est?: number;
+  expected_cost_est?: number;
+  candidate_costs?: CandidateCost[];
+  chosen_reason?: 'cheapest_by_expected_cost' | 'policy_default';
+  max_cost_usd?: number;
+  budget_actions?: Array<'compacted' | 'reduced_output_tokens' | 'model_switched'>;
+  expected_cost_vs_budget?: string;
+  compacted?: boolean;
+  tokens_before_est?: number;
+  tokens_after_est?: number;
+  savings_tokens_est?: number;
+  expected_cost_savings_est?: number;
+  compactor_expected_cost_est?: number;
+  compactor_cost_est?: number;
+  compactor_timeout_ms?: number;
+  compactor_latency_ms?: number;
+  compaction_reason?: 'over_budget' | 'worth_it';
+  compaction_attempted?: boolean;
+  compaction_applied?: boolean;
+  compaction_skipped_reason?: 'skipped_threshold' | 'tool_route' | 'code_edit_preserve';
+  compaction_error?: string;
 }
 
 export interface DecisionCard {
@@ -31,6 +67,30 @@ export interface DecisionCard {
   tool_used: boolean;
   latency_ms: number;
   usage: Usage;
+  input_tokens_est?: number;
+  output_tokens_est?: number;
+  expected_cost_est?: number;
+  candidate_costs?: CandidateCost[];
+  chosen_reason?: 'cheapest_by_expected_cost' | 'policy_default';
+  max_cost_usd?: number;
+  budget_actions?: Array<'compacted' | 'reduced_output_tokens' | 'model_switched'>;
+  expected_cost_vs_budget?: string;
+  actual_usage?: TokenUsage;
+  actual_cost?: number;
+  compacted?: boolean;
+  tokens_before_est?: number;
+  tokens_after_est?: number;
+  savings_tokens_est?: number;
+  expected_cost_savings_est?: number;
+  compactor_expected_cost_est?: number;
+  compactor_cost_est?: number;
+  compactor_timeout_ms?: number;
+  compactor_latency_ms?: number;
+  compaction_reason?: 'over_budget' | 'worth_it';
+  compaction_attempted?: boolean;
+  compaction_applied?: boolean;
+  compaction_skipped_reason?: 'skipped_threshold' | 'tool_route' | 'code_edit_preserve';
+  compaction_error?: string;
   ts?: string;
   error?: string | null;
 }
@@ -50,6 +110,30 @@ export interface LogResponse {
     tool_used: boolean;
     latency_ms: number;
     usage: Usage;
+    input_tokens_est?: number;
+    output_tokens_est?: number;
+    expected_cost_est?: number;
+    candidate_costs?: CandidateCost[];
+    chosen_reason?: 'cheapest_by_expected_cost' | 'policy_default';
+    max_cost_usd?: number;
+    budget_actions?: Array<'compacted' | 'reduced_output_tokens' | 'model_switched'>;
+    expected_cost_vs_budget?: string;
+    actual_usage?: TokenUsage;
+    actual_cost?: number;
+    compacted?: boolean;
+    tokens_before_est?: number;
+    tokens_after_est?: number;
+    savings_tokens_est?: number;
+    expected_cost_savings_est?: number;
+    compactor_expected_cost_est?: number;
+    compactor_cost_est?: number;
+    compactor_timeout_ms?: number;
+    compactor_latency_ms?: number;
+    compaction_reason?: 'over_budget' | 'worth_it';
+    compaction_attempted?: boolean;
+    compaction_applied?: boolean;
+    compaction_skipped_reason?: 'skipped_threshold' | 'tool_route' | 'code_edit_preserve';
+    compaction_error?: string;
     error: string | null;
   }>;
 }

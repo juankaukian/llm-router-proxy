@@ -1,0 +1,37 @@
+{
+  "currency": "USD",
+  "models": {
+    "llm.math.small": {
+      "logical_route": "llm.small",
+      "provider": "ollama",
+      "model": "qwen2.5-math:7b",
+      "in_per_1m": 0,
+      "out_per_1m": 0,
+      "context_window": 32768
+    },
+    "llm.general.small": {
+      "logical_route": "llm.small",
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "in_per_1m": 0.15,
+      "out_per_1m": 0.6,
+      "context_window": 128000
+    },
+    "llm.general.mid": {
+      "logical_route": "llm.mid",
+      "provider": "openai",
+      "model": "gpt-4.1-mini",
+      "in_per_1m": 0.4,
+      "out_per_1m": 1.6,
+      "context_window": 128000
+    },
+    "llm.reasoning.big": {
+      "logical_route": "llm.big",
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "in_per_1m": 2.0,
+      "out_per_1m": 8.0,
+      "context_window": 128000
+    }
+  }
+}

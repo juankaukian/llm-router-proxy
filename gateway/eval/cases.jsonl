@@ -1,0 +1,5 @@
+{"id":"math-001","category":"math","messages":[{"role":"user","content":"37 / 145 = ?"}],"expect":{"type":"number","value":0.2551724138,"epsilon":0.00001}}
+{"id":"rewrite-001","category":"rewrite","messages":[{"role":"user","content":"Rewrite this sentence to be clearer: We done deploy and now users maybe can login."}],"expect":{"type":"contains","value":"login"}}
+{"id":"logs-001","category":"logs","messages":[{"role":"user","content":"Analyze these logs and identify likely root cause:\n2026-03-01T10:00:00Z INFO app boot\n2026-03-01T10:00:02Z WARN db retry 1\n2026-03-01T10:00:03Z ERROR db timeout\n2026-03-01T10:00:04Z ERROR request failed"}],"expect":{"type":"contains","value":"timeout"}}
+{"id":"code-001","category":"code","messages":[{"role":"user","content":"Write a TypeScript function that returns the factorial of n recursively. Keep it short."}],"expect":{"type":"contains","value":"function"}}
+{"id":"reasoning-001","category":"reasoning","messages":[{"role":"user","content":"Compare optimistic vs pessimistic locking in one paragraph."}],"expect":{"type":"contains","value":"locking"}}
